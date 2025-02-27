@@ -754,3 +754,511 @@ Data scoping in OpenMP defines how variables are mapped to threads. The choice a
 
 Understanding these clauses is vital for writing robust, maintainable parallel programs. Each clause targets a specific scenario—some unify final results, others provide necessary local copies, and others preserve across multiple parallel regions. By systematically applying variable scoping rules, OpenMP programs remain clearer, safer, and more performance-focused.
 
+
+# 2.4 Synchronization
+
+This section explores the **synchronization mechanisms** in OpenMP that safeguard *shared data* when multiple threads concurrently access or modify it. In shared-memory programming, synchronization ensures *correctness* and *consistency*. Here, we examine different synchronization constructs and their use cases, with examples illustrating how to prevent race conditions or guarantee ordering.
+
+---
+
+## 2.4.1 Single
+
+**Key Concept**: The **`single`** construct identifies a block of code that only one thread in a team executes, while other threads skip that block. When a thread encounters `single`, it takes ownership of that block’s execution. Afterward, by default, all threads synchronize at an *implicit barrier*, ensuring everyone waits until the single block finishes (unless `nowait` is specified).
+
+A practical scenario might involve reading input, setting parameters, or performing a one-time initialization. Let us formalize:
+
+```c
+#pragma omp parallel
+#pragma omp single [clause ...]
+{
+   // Code executed by exactly one thread
+}
+```
+
+The entry into the `single` region requires no special barrier. Only the chosen thread executes the block. By default, an implicit barrier occurs at the *end*, meaning all threads wait there unless `nowait` is used. This default barrier is essential when all threads need the results from the single thread’s work.
+
+An **example** might have each thread perform computations in parallel, but only one thread prints a debug message or reads input data. The `single` directive ensures exactly one copy of that activity occurs.
+
+The **intuition** is that `single` is a lightweight way to specify *one-thread-only* work inside a parallel region. The property that any thread may execute it—rather than enforcing the master thread—can sometimes be exploited for concurrency if the master is busy doing something else.
+
+---
+
+## 2.4.2 Master and Parallel Master Constructs
+
+**Key Concept**: The **`master`** construct is similar to `single` in that it restricts a code region to one thread. However, it always enforces that the *master thread* of the team is the one executing the block. The other threads simply skip that block altogether without any implicit barrier. This absence of a barrier contrasts with `single`, which inserts a barrier at the block’s end by default.
+
+```c
+#pragma omp master
+{
+   // Only the master thread executes this block
+}
+```
+
+In OpenMP 5.0, there is also **`parallel master`**, combining the start of a parallel region with the `master` concept, but crucially still meaning only the master thread performs the structured block. There is *no implicit barrier* at entry or exit for `master`. This can be faster when one wants to avoid stalling other threads.
+
+The **intuition**: Use `master` when you need the **master thread** specifically to execute certain steps (perhaps for consistent I/O or to avoid switching threads for a delicate operation) and you do not need the implicit barrier that `single` would provide.
+
+---
+
+### 2.4.2.1 Example: Master
+
+An illustration of `master` usage:
+
+```c
+#pragma omp parallel shared(x)
+{
+   int id = omp_get_thread_num();
+   print_intermediate_results();
+
+   #pragma omp master
+   {
+      do_some_data_initialization();
+   }
+
+   #pragma omp barrier
+   {
+      // After the barrier, all threads proceed simultaneously
+   }
+
+   #pragma omp for
+   for (int i = 0; i < 5; i++) {
+      x[i] += i;
+   }
+
+   #pragma omp master
+   {
+      print_final_results();
+   }
+}
+```
+
+In this code, only the master thread executes `do_some_data_initialization()` and `print_final_results()`. A manual `#pragma omp barrier` is inserted before the parallel loop to ensure that initialization is complete before all threads start using the initialized data. Notice that without a barrier, threads could race ahead and read uninitialized values if the master thread had not finished.
+
+---
+
+## 2.4.3 Critical
+
+**Key Concept**: A **`critical`** section ensures that *only one thread* at a time can execute the enclosed structured block. Other threads attempting to enter the same named or unnamed critical section must wait until the executing thread finishes. In effect, `critical` is an *implementation-level mutual exclusion construct*, preventing data races in shared-memory regions.
+
+```c
+#pragma omp critical [name [hint(hint-expression)]]
+{
+   // Code block that only one thread can enter at a time
+}
+```
+
+There is a performance note: `critical` can be *costly* because it forces threads to serialize whenever they encounter that region. One should thus consider whether *atomic* or *lock* constructs might be more efficient if only a specific memory operation needs protection.
+
+An **example** might be updating a shared sum inside a long loop. Ensuring only one thread updates the sum at a time prevents race conditions. However, a `critical` might bottleneck performance if the loop is large.
+
+---
+
+### 2.4.3.1 Example: Critical
+
+Below is a minimal illustration. Suppose each thread removes an item from two lists `listx` and `listy`, processing them in some manner. Two different named critical sections protect each list:
+
+```c
+#pragma omp parallel
+{
+   #pragma omp critical xvalues
+   {
+      Val x = remove_item(listx);
+      process(x);
+   }
+   
+   #pragma omp critical yvalues
+   {
+      Val y = remove_item(listy);
+      process(y);
+   }
+}
+```
+
+In this code, a thread that is removing an item from `listx` under `critical xvalues` does not block other threads from entering the `yvalues` critical section. If the same (unnamed) critical section was used for both lists, then even accessing different lists would serialize all threads. By naming them differently, concurrency is increased.
+
+---
+
+## 2.4.4 Lock Routines (Runtime API)
+
+**Key Concept**: An **OpenMP lock** is a lower-level mechanism that grants a single thread exclusive access to specific data or code regions. It functions like a more manual version of a critical section. Instead of guarding *code*, a lock typically guards *data*, letting the user decide precisely when to acquire and release it.
+
+The basic lock routines are declared in `<omp.h>` as:
+```c
+void omp_set_lock(omp_lock_t *lock);
+void omp_unset_lock(omp_lock_t *lock);
+void omp_init_lock(omp_lock_t *lock);
+void omp_destroy_lock(omp_lock_t *lock);
+
+int  omp_test_lock(omp_lock_t *lock);
+```
+
+There are two lock types: **simple locks** and **nestable locks**. A simple lock cannot be set multiple times by the same thread, whereas a nestable lock can be acquired repeatedly by the same thread.
+
+Locks create a memory fence, meaning all thread-visible shared variables are consistent upon acquiring or releasing a lock.
+
+---
+
+### 2.4.4.1 Lock Example
+
+One might initialize and use a lock in the following way:
+
+```c
+omp_lock_t locka;
+omp_init_lock(&locka);
+
+#pragma omp parallel sections
+{
+   #pragma omp section
+   {
+      omp_set_lock(&locka);
+      access_array_A();
+      omp_unset_lock(&locka);
+   }
+
+   #pragma omp section
+   {
+      omp_set_lock(&locka);
+      access_array_A();
+      omp_unset_lock(&locka);
+   }
+}
+
+omp_destroy_lock(&locka);
+```
+
+Here, both sections share the same lock (`locka`), thus serializing `access_array_A()`. If the array sections are disjoint, better performance might be obtained by using multiple locks so that different threads do not block each other unnecessarily.
+
+---
+
+## 2.4.5 Atomic
+
+**Key Concept**: **`atomic`** is a special directive that ensures an *uninterrupted, atomic operation* on a specific memory location, often corresponding to hardware-level atomic operations if the CPU supports them. Unlike `critical`, which protects a code *block*, `atomic` specifically protects a *single load/store/update* on a shared variable.
+
+The syntax often appears in forms like:
+
+```c
+#pragma omp atomic update
+shared_var = shared_var + expression;
+```
+
+or simply:
+
+```c
+#pragma omp atomic
+shared_var += expression;
+```
+
+The clauses such as `read`, `write`, `update`, or `capture` define how the atomic operation is performed. For instance, `capture` can read the old value and write a new one atomically.
+
+---
+
+### 2.4.5.1 Atomic Examples
+
+A read-protected example:
+```c
+int tmp;
+#pragma omp atomic read
+tmp = shared_counter;
+```
+This ensures that reading from `shared_counter` is done atomically.
+
+An update example:
+```c
+#pragma omp atomic
+ic = ic + 1;
+```
+All threads increment `ic` in a way that prevents lost updates.
+
+A capture example might look like this:
+```c
+int d;
+#pragma omp atomic capture
+{
+   d = v;
+   v += 1;
+}
+```
+First the old value of `v` is captured into `d`, and then `v` is incremented, all in one atomic step.
+
+---
+
+### 2.4.5.2 Atomic vs. Critical
+
+An **intuition** is that `atomic` is often more lightweight and suitable for protecting a single memory update, such as increments to a counter. A `critical` region is more expensive, especially if it encloses more complex operations. However, if you need to protect multiple statements or operate on multiple variables as a single mutual-exclusion region, `critical` might be more appropriate.
+
+---
+
+## 2.4.6 Barrier
+
+**Key Concept**: A **`barrier`** is a synchronization point where *all threads in a team must arrive before any can proceed*. When a thread encounters a barrier, it waits until every other thread has also encountered that barrier. Only then do they all continue.
+
+In OpenMP, `barrier` can be **explicit**:
+```c
+#pragma omp barrier
+```
+or **implicit**, typically at the end of worksharing constructs such as `for` or `sections`, unless `nowait` is used.
+
+The **intuition** is that barriers are essential when partial results produced by different threads must be ready before moving to the next phase. However, barriers can *hurt performance* if used too frequently, because they force a strict synchronization among threads.
+
+---
+
+### 2.4.6.1 Barrier Example
+
+Consider a parallel region where threads must each finish sorting different segments of an array before searching for a target value:
+
+```c
+#pragma omp parallel shared(x)
+{
+   int id = omp_get_thread_num();
+   sort_part(id);
+   
+   #pragma omp barrier
+   search_target(x);
+
+   #pragma omp for nowait
+   for(int i = 0; i < N; i++) {
+      do_something(i);
+   }
+}
+```
+
+In this example, each thread first sorts part of the data. If the array segments are interdependent, we must ensure all partial sorts are complete before any thread calls `search_target(x)`. The barrier accomplishes that synchronization.
+
+---
+
+## 2.4.7 Ordered
+
+**Key Concept**: The **`ordered`** construct forces *sequential ordering* of certain parts of a parallelized loop (or other concurrency scenario) that would otherwise run in parallel. Within a loop construct annotated with `ordered`, any code enclosed by `#pragma omp ordered` is executed *in the order of the original, sequential loop*.
+
+A typical usage:
+
+```c
+#pragma omp for ordered
+for(int i = 0; i < N; i++) {
+   // Parallel portion
+   #pragma omp ordered
+   {
+      // Region that must run in the iteration order
+   }
+}
+```
+
+The **intuition**: If a loop is otherwise safe to parallelize, but certain operations (like printing results in ascending iteration order) must remain strictly ordered, `ordered` allows partial ordering constraints. This often involves overhead, so it should be used only when necessary.
+
+---
+
+### 2.4.7.1 Ordered and Task Dependencies
+
+OpenMP 5.0 extends `ordered` to handle task dependencies, enabling advanced patterns like *doacross loops*. The idea is to define *cross-iteration dependencies* where each iteration can only proceed after the previous iteration completes certain tasks. For instance:
+
+```c
+#pragma omp single
+{
+   for(int i = 0; i < 4; i++) {
+      #pragma omp task firstprivate(i) depend(out: i)
+      {
+         // Some computation
+         #pragma omp ordered depend(sink: i-1)
+         // Ordered portion
+         #pragma omp ordered depend(source)
+      }
+   }
+}
+```
+
+This snippet ensures iteration `i` depends on iteration `i-1` (sink/source). The concurrency is preserved, except for the part that requires explicit ordering.
+
+---
+
+## 2.4.8 Summary of Synchronization
+
+Synchronization constructs in OpenMP provide a range of granularity and power:
+
+**`single`** ensures exactly one thread runs a block, inserting a default barrier at the end.  
+**`master`** enforces that the master thread alone executes a block, with *no* implicit barrier.  
+**`critical`** serializes a region among threads, guaranteeing *mutual exclusion* for that block.  
+**Locks** allow *finer* manual control over access to data rather than code.  
+**`atomic`** provides lightweight protection for a single memory operation.  
+**`barrier`** enforces a *full synchronization point*, letting all threads catch up before proceeding.  
+**`ordered`** partially serializes certain statements in a loop or tasks to retain a necessary order.
+
+Each mechanism addresses different concurrency scenarios: controlling *who* executes a block, *how* data updates are protected, or *when* threads must sync up. By combining these constructs effectively, we can write correct and efficient shared-memory applications.
+
+
+# 2.5 (Explicit) Tasks
+
+This final section addresses **explicit tasks** in OpenMP, introduced to enable more dynamic and flexible parallelism beyond the static loop and sections models. The emphasis lies on *task parallelism*, where independent (or partially independent) operations can be encapsulated into tasks that are then executed by a team of threads in potentially unbounded or nested ways.
+
+---
+
+## 2.5.1 Parallelism Control Structures: Task Parallelism
+
+Task parallelism focuses on enabling independent units of work to run in parallel, even if they do not fit the traditional loop-based (data-parallel) approach. The OpenMP constructs for task parallelism allow creation of tasks anywhere in the code. Each task has code, data, and an assigned thread to perform it.
+
+In earlier worksharing constructs such as `sections` or `for`, tasks are *implicit* because threads simply perform those instructions in parallel. With explicit tasks, a program can spawn new tasks dynamically, for example during recursion or while traversing complex data structures. This flexibility leads to more powerful concurrency patterns that can reveal additional parallelism.
+
+---
+
+## 2.5.2 Tasking Terminology
+
+OpenMP distinguishes two types of tasks:
+
+An **implicit task** is created automatically at the start of a parallel region for each thread in the team. These are the usual tasks that run the code enclosed by `#pragma omp parallel`.
+
+An **explicit task** is created whenever a `task` construct or related directive is encountered. The thread that encounters the construct may execute the task immediately or defer its execution to another thread, depending on scheduling choices made by the runtime. This enables a wide range of dynamic parallel behaviors.
+
+The phrase **task region** denotes all code inside a single explicit task, including any nested tasks that might be generated. While **parallel regions** hold multiple implicit tasks, the introduction of explicit tasks broadens concurrency opportunities.
+
+---
+
+## 2.5.3 What Are Tasks?
+
+A task is a package of code and data. Once created, it can be executed by any thread in the current team. The task has two principal components: the instructions (the function or statements to run) and the data environment (the variables and values it needs). The creation of a task does not necessarily mean it executes immediately. The runtime may queue it for execution by whichever thread becomes available.
+
+The key concept of tasks is that concurrency can now be expressed with greater finesse than static loop boundaries. This allows creative strategies:
+
+One thread might traverse a data structure, generating tasks as new parts of the structure are discovered. Another thread can concurrently pull tasks off a queue and execute them, ensuring balanced use of resources. This is useful for recursive algorithms, dynamic work generation, or scenarios where the amount of work is not known in advance.
+
+---
+
+## 2.5.4 Task Construct
+
+OpenMP provides the `task` directive to create explicit tasks. It appears as:
+
+```
+#pragma omp task [clause ...]
+structured-block
+```
+
+When a thread encounters `#pragma omp task`, it packages the code in `structured-block` and any relevant data (by default `firstprivate` for local variables, but subject to scoping clauses) into a task. The runtime can run it immediately or store it for later execution. Tasks may also be nested, meaning tasks can create further tasks recursively or iteratively.
+
+Properties of explicit tasks include the possibility of specifying dependencies via the `depend` clause, controlling the order in which tasks may execute. A barrier or a `taskwait` ensures that all previously created tasks complete. The environment fosters dynamic load balancing because idle threads can help with the existing backlog of tasks.
+
+---
+
+### 2.5.4.1 Example: Task Construct Example
+
+A minimal illustration is:
+
+```
+#pragma omp parallel
+{
+   #pragma omp single
+   {
+      #pragma omp task
+      functionA();
+
+      #pragma omp task
+      functionB();
+
+      #pragma omp task
+      functionC();
+   }
+}
+```
+
+The `parallel` directive creates a team of threads. Only one thread (due to `single`) executes the code that creates tasks. Three tasks are then generated: `functionA`, `functionB`, and `functionC`. The runtime can distribute these tasks among all threads in the team. The threads run them in any order, possibly concurrently. After the `single` block ends, no threads can create further tasks in that block, but the tasks already generated remain to be executed. By the time the parallel region ends, all tasks have completed (they cannot outlive the region).
+
+The intuition here is that work is separated into three calls (A, B, C). Instead of having a single thread run them sequentially, each call becomes a separate task that multiple threads can help finish. This separation often speeds up the total run time if the tasks involve substantial independent computations.
+
+---
+
+## 2.5.5 Taskloop Construct
+
+OpenMP 5.0 introduced the `taskloop` construct, which allows loop iterations to be converted into explicit tasks, rather than the implicit tasks created by `parallel for`. The syntax looks like:
+
+```
+#pragma omp taskloop [clause ...]
+for (int i = 0; i < N; i++) {
+   // loop body
+}
+```
+
+This is particularly useful for scenarios where the loop’s workload is large but irregular, or when further dependencies among iterations must be controlled. The runtime divides the loop into tasks of a certain size (possibly specified by `grainsize` or `num_tasks` clauses), distributing them across available threads.
+
+The properties of `taskloop` can resemble manual blocking or chunking but automated by OpenMP. It blends data parallel (loop-based) logic with the dynamic scheduling advantages of tasks. In essence, each chunk of loop iterations becomes an explicit task that can be picked up at different times by different threads.
+
+---
+
+### 2.5.5.1 Example: Taskloop vs Task vs Manual Coding
+
+A simple scalar multiply might look like this:
+
+```
+#pragma omp taskloop grainsize(GR)
+for(int i = 0; i < SIZE; i++) {
+   A[i] = B[i] * S;
+}
+```
+
+If done with explicit tasks manually, one would repeatedly create tasks for each chunk in a loop. That can be verbose or tricky to maintain. The `taskloop` directive is more direct. It can produce better load balancing for dynamic scenarios than a static `parallel for`, while keeping code simpler than a fully manual approach.
+
+---
+
+## 2.5.6 Tasks (OpenMP 3.0+): Example Traversing Linked Lists Recursively
+
+A common use case for explicit tasks is *recursive data structures*. If a list or tree is traversed, we might want to process left and right subbranches in parallel.
+
+Consider a function:
+
+```
+void traverse(struct node *p) {
+   if (p->left) {
+      #pragma omp task
+      traverse(p->left);
+   }
+   if (p->right) {
+      #pragma omp task
+      traverse(p->right);
+   }
+   process(p);
+}
+```
+
+Each time we encounter a non-null left or right pointer, we create a new task to traverse that subtree. Because `process(p)` occurs after spawning tasks for the children, we can exploit concurrency without rewriting the entire structure as an iterative approach. If the data structure is large and balanced, many tasks can be generated, distributing the traversal among multiple threads efficiently.
+
+---
+
+## 2.5.7 Tasks (OpenMP 3.0+): Example Fibonacci Numbers
+
+Another canonical illustration is the Fibonacci function. The function below is purely to demonstrate task creation patterns; it is not necessarily the fastest way to compute Fibonacci numbers. It does, however, showcase how a recursive call tree can spawn tasks at each step.
+
+```
+int fib(int n) {
+   int i, j;
+   if (n < 2) return n;
+   else {
+      #pragma omp task shared(i)
+      i = fib(n - 1);
+      #pragma omp task shared(j)
+      j = fib(n - 2);
+      #pragma omp taskwait
+      return i + j;
+   }
+}
+```
+
+A single thread initially calls `fib(NW)`. Upon encountering each `#pragma omp task`, it spawns tasks that themselves call `fib(...)` recursively. The `taskwait` ensures that the function does not return until the two spawned tasks finish. This builds a binary tree of tasks, each child computing part of the Fibonacci sequence. Different threads can pick up tasks from the pool, leading to parallel execution.
+
+---
+
+### 2.5.7.1 Execution Yields a Binary Tree of Tasks
+
+For instance, `fib(4)` yields a binary tree of tasks: `fib(3)` and `fib(2)` become tasks. Then `fib(3)` spawns `fib(2)` and `fib(1)`, while `fib(2)` spawns `fib(1)` and `fib(0)`. As the recursion unfolds, a task graph forms. Several threads can work on different branches simultaneously. Dependencies are locally enforced by `taskwait` at each function level.
+
+The intuition is that each call can proceed independently except when it must combine results, which is exactly when `taskwait` synchronizes them. With large recursion depths, load balancing is improved because tasks are created on the fly.
+
+---
+
+## 2.5.8 Summary of (Explicit) Tasks
+
+Explicit tasks in OpenMP allow dynamic parallelism by creating work units that can be deferred, nested, or scheduled flexibly. This is in contrast to purely static worksharing. The main constructs are:
+
+`task`, which generates tasks at any point in the code.  
+`taskloop`, which converts loop iterations into tasks rather than relying on static scheduling.  
+
+The essential property is that concurrency is found not just in loops but in any piecewise independent blocks, especially helpful in recursive algorithms or irregular data structures. Task parallelism can yield more balanced use of processor resources and can scale well if the tasks are numerous and well-sized.
+
+With explicit tasks, OpenMP supports both data parallelism and task parallelism, ensuring that a wide variety of scientific and industrial applications can leverage shared-memory multicore architectures effectively and efficiently.
+
+
